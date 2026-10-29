@@ -3,7 +3,12 @@ name: Snøvarsel
 on:
   schedule:
     - cron: "15 */3 * * *"   # hver 3. time (UTC)
-  workflow_dispatch:          # gjør det mulig å kjøre manuelt for test
+  workflow_dispatch:
+    inputs:
+      test_epost:
+        description: "Send bare en test-e-post"
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # trengs for å lagre hvilke varsler som er sendt
@@ -23,6 +28,7 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          TEST_EPOST: ${{ inputs.test_epost }}
           MET_KONTAKT: "snovarsel/1.0 ${{ secrets.SMTP_USER }}"
         run: python snovarsel.py
 
