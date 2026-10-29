@@ -24,6 +24,7 @@ STEDER = [
     {"navn": "Skramstadsætra", "lat": 61.15, "lon": 11.15},
     {"navn": "Holleia", "lat": 60.15, "lon": 10.00},
     {"navn": "Meitsjøen", "lat": 60.3833, "lon": 11.8167},
+    {"navn": "Ryskdalen", "lat": 61.3206, "lon": 12.6080},
 ]
 
 DAGER_FREMOVER = 7        # Hvor langt frem i prognosen vi ser etter snø
