@@ -1,6 +1,6 @@
 """
 Snøvarsel: sjekker værprognosen fra MET (samme data som Yr) for flere steder
-og sender e-post når det er meldt snø. Varsler kommer i to trinn:
+og sender e-post når det er meldt snø. E-posten viser også vind for alle steder. Varsler kommer i to trinn:
 «tidlig varsel» for snø et stykke frem i tid, og «bekreftet» når snøen
 fortsatt står i prognosen kort tid før. Hvert trinn sendes bare én gang
 per sted og dato.
@@ -43,10 +43,11 @@ KONTAKT = os.environ.get("MET_KONTAKT", "snovarsel/1.0 ukjent@example.com")
 
 TILSTANDSFIL = Path(__file__).with_name("varslet.json")
 TIDSSONE = ZoneInfo("Europe/Oslo")
-API = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+API = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
 
 UKEDAGER = ["man", "tir", "ons", "tor", "fre", "lør", "søn"]
 UKEDAGER_LANG = ["mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag"]
+KOMPASS = ["N", "NØ", "Ø", "SØ", "S", "SV", "V", "NV"]
 MANEDER = ["jan", "feb", "mar", "apr", "mai", "jun", "jul", "aug", "sep", "okt", "nov", "des"]
 
 # ---------------------------------------------------------------------------
@@ -67,8 +68,11 @@ def er_sno(symbol):
     return TA_MED_SLUDD and "sleet" in symbol
 
 
-def finn_snodager(prognose):
-    """Returnerer {dato: {"mm": sum nedbør, "min_temp": laveste temp}} for dager med snø."""
+def analyser_dager(prognose):
+    """Lager et sammendrag per dag:
+    {dato: {"mm", "min_temp", "vind", "kast", "retning"}}.
+    "mm" er snømengde (0 hvis ingen snø), "min_temp" laveste temperatur
+    mens det snør, og vind er sterkeste middelvind med kast og retning."""
     grense = datetime.now(timezone.utc) + timedelta(days=DAGER_FREMOVER)
     dager = {}
     for punkt in prognose["properties"]["timeseries"]:
@@ -76,7 +80,22 @@ def finn_snodager(prognose):
         if tid > grense:
             break
         data = punkt["data"]
-        # Bruk timesprognose der den finnes, ellers 6-timersprognose
+        detaljer = data["instant"]["details"]
+        dato = tid.astimezone(TIDSSONE).date().isoformat()
+        dag = dager.setdefault(dato, {
+            "mm": 0.0, "min_temp": None, "vind": None, "kast": None, "retning": None,
+        })
+
+        # Vind
+        vind = detaljer.get("wind_speed")
+        if vind is not None and (dag["vind"] is None or vind > dag["vind"]):
+            dag["vind"] = vind
+            dag["retning"] = detaljer.get("wind_from_direction")
+        kast = detaljer.get("wind_speed_of_gust")
+        if kast is not None and (dag["kast"] is None or kast > dag["kast"]):
+            dag["kast"] = kast
+
+        # Snø – bruk timesprognose der den finnes, ellers 6-timersprognose
         periode = data.get("next_1_hours") or data.get("next_6_hours")
         if not periode:
             continue
@@ -84,10 +103,8 @@ def finn_snodager(prognose):
         mm = periode.get("details", {}).get("precipitation_amount", 0.0)
         if not er_sno(symbol) or mm < MIN_NEDBOR_MM:
             continue
-        dato = tid.astimezone(TIDSSONE).date().isoformat()
-        temp = data["instant"]["details"].get("air_temperature")
-        dag = dager.setdefault(dato, {"mm": 0.0, "min_temp": temp})
         dag["mm"] += mm
+        temp = detaljer.get("air_temperature")
         if temp is not None and (dag["min_temp"] is None or temp < dag["min_temp"]):
             dag["min_temp"] = temp
     return dager
@@ -134,6 +151,34 @@ def fmt_temp(t):
     return "–" if t is None else f"{t:.0f} °C"
 
 
+def kompass(grader):
+    if grader is None:
+        return ""
+    return KOMPASS[int((grader + 22.5) % 360 // 45)]
+
+
+def fmt_vind(info):
+    if info.get("vind") is None:
+        return "–"
+    tekst = f"{info['vind']:.0f} m/s"
+    if info.get("kast") is not None:
+        tekst += f" (kast {info['kast']:.0f})"
+    if info.get("retning") is not None:
+        tekst += f" fra {kompass(info['retning'])}"
+    return tekst
+
+
+def vind_farge(ms):
+    """Bakgrunns- og tekstfarge etter vindstyrke (Yr sine kategorier)."""
+    if ms < 5.5:    # flau vind / lett bris
+        return "#f6f8fa", "#5b6b7a"
+    if ms < 10.8:   # bris
+        return "#fff3cd", "#6b5300"
+    if ms < 17.2:   # kuling
+        return "#ffd29a", "#7a3d00"
+    return "#e8743b", "#ffffff"   # storm
+
+
 def celle_farge(mm):
     """Bakgrunns- og tekstfarge etter snømengde."""
     if mm < 1:
@@ -163,7 +208,8 @@ def lag_tekst(nye):
             linje = (
                 f"• {v['sted']['navn']}: {lang_dato(v['dato'])} – "
                 f"ca. {v['info']['mm']:.1f} mm (≈ {v['info']['mm']:.0f} cm), "
-                f"ned mot {fmt_temp(v['info']['min_temp'])}"
+                f"ned mot {fmt_temp(v['info']['min_temp'])}, "
+                f"vind {fmt_vind(v['info'])}"
             )
             if v["var_tidlig"]:
                 linje += " (varslet tidlig, står fortsatt i prognosen)"
@@ -214,7 +260,7 @@ def lag_oversikt_html(oversikt, nye_nokler, i_dag):
             info = oversikt.get(navn, {}).get(d.isoformat())
             kort_sikt = i <= BEKREFTET_DAGER
             tom_bg = "#f3f8fd" if kort_sikt else "#ffffff"
-            if info is None:
+            if info is None or info["mm"] <= 0:
                 rad += (
                     f'<td style="padding:6px 4px;text-align:center;color:#c2ccd6;'
                     f'background:{tom_bg};border-bottom:1px solid #e6edf3;">·</td>'
@@ -239,6 +285,71 @@ def lag_oversikt_html(oversikt, nye_nokler, i_dag):
         f'vertical-align:middle;"></span> = nytt i denne e-posten. '
         f"De første {BEKREFTET_DAGER + 1} kolonnene (lys bakgrunn) er kort sikt. "
         f"Klikk på et stedsnavn for å åpne Yr.</p>"
+    )
+
+
+def lag_vind_html(oversikt, i_dag):
+    """Rutenett med sterkeste vind per dag for alle steder."""
+    datoer = [i_dag + timedelta(days=i) for i in range(DAGER_FREMOVER + 1)]
+
+    hode = (
+        f'<th style="padding:8px 10px;text-align:left;font-size:12px;color:#5b6b7a;'
+        f'border-bottom:2px solid #d5e2ee;">Sted</th>'
+    )
+    for i, d in enumerate(datoer):
+        bg = "#f3f8fd" if i <= BEKREFTET_DAGER else "#ffffff"
+        hode += (
+            f'<th style="padding:8px 4px;text-align:center;font-size:12px;color:#5b6b7a;'
+            f'background:{bg};border-bottom:2px solid #d5e2ee;white-space:nowrap;">'
+            f"{UKEDAGER[d.weekday()]}<br>"
+            f'<span style="font-weight:normal;">{d.day}.{d.month}</span></th>'
+        )
+
+    rader = ""
+    for sted in STEDER:
+        navn = sted["navn"]
+        rad = (
+            f'<td style="padding:8px 10px;font-size:14px;font-weight:600;color:#1f2d3a;'
+            f'border-bottom:1px solid #e6edf3;white-space:nowrap;">{html.escape(navn)}</td>'
+        )
+        for d in datoer:
+            info = oversikt.get(navn, {}).get(d.isoformat())
+            if not info or info.get("vind") is None:
+                rad += (
+                    '<td style="padding:6px 4px;text-align:center;color:#c2ccd6;'
+                    'border-bottom:1px solid #e6edf3;">·</td>'
+                )
+                continue
+            bg, fg = vind_farge(info["vind"])
+            under = []
+            if info.get("kast") is not None:
+                under.append(f"{info['kast']:.0f}")
+            if info.get("retning") is not None:
+                under.append(kompass(info["retning"]))
+            rad += (
+                f'<td style="padding:5px 3px;text-align:center;background:{bg};color:{fg};'
+                f'border-bottom:1px solid #ffffff;border-left:1px solid #ffffff;">'
+                f'<div style="font-size:13px;font-weight:700;">{info["vind"]:.0f}</div>'
+                f'<div style="font-size:10px;white-space:nowrap;">{" · ".join(under)}</div></td>'
+            )
+        rader += f"<tr>{rad}</tr>"
+
+    def merke(farge, tekst, bg):
+        return (
+            f'<span style="display:inline-block;background:{bg};color:{farge};'
+            f'padding:1px 6px;border-radius:3px;margin-right:4px;">{tekst}</span>'
+        )
+
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" width="100%" '
+        f'style="border-collapse:collapse;font-family:{FONT};">'
+        f"<tr>{hode}</tr>{rader}</table>"
+        f'<p style="margin:10px 0 0;font-size:12px;color:#5b6b7a;line-height:1.8;">'
+        f"Stort tall = sterkeste middelvind (m/s). Under: vindkast · retning vinden kommer fra.<br>"
+        f'{merke("#5b6b7a", "under 5.5 svak", "#f6f8fa")}'
+        f'{merke("#6b5300", "5.5–10.7 bris", "#fff3cd")}'
+        f'{merke("#7a3d00", "10.8–17.1 kuling", "#ffd29a")}'
+        f'{merke("#ffffff", "17.2+ storm", "#e8743b")}</p>'
     )
 
 
@@ -272,6 +383,7 @@ def lag_detaljer_html(nye, type_varsel):
             f'<td style="{cell}white-space:nowrap;">{info["mm"]:.1f} mm '
             f'<span style="color:#5b6b7a;">(≈ {info["mm"]:.0f} cm)</span></td>'
             f'<td style="{cell}white-space:nowrap;">{fmt_temp(info["min_temp"])}</td>'
+            f'<td style="{cell}white-space:nowrap;">{fmt_vind(info)}</td>'
             f'<td style="{cell}white-space:nowrap;"><a href="{yr_lenke(v["sted"])}" '
             f'style="color:#2f6aa3;text-decoration:none;font-weight:600;">Yr →</a></td>'
             f"</tr>"
@@ -285,7 +397,7 @@ def lag_detaljer_html(nye, type_varsel):
         '<table role="presentation" cellpadding="0" cellspacing="0" width="100%" '
         f'style="border-collapse:collapse;font-family:{FONT};">'
         f'<tr><th style="{th}">Sted</th><th style="{th}">Dag</th><th style="{th}">Snø</th>'
-        f'<th style="{th}">Laveste</th><th style="{th}"></th></tr>'
+        f'<th style="{th}">Laveste</th><th style="{th}">Vind</th><th style="{th}"></th></tr>'
         f"{linjer}</table>"
     )
 
@@ -326,8 +438,10 @@ def lag_html(oversikt, nye, i_dag):
 </td></tr>
 
 <tr><td style="padding:24px 28px 8px;">
-  <h2 style="margin:0 0 12px;font-size:17px;color:#1f2d3a;">Oversikt neste {DAGER_FREMOVER} dager</h2>
+  <h2 style="margin:0 0 12px;font-size:17px;color:#1f2d3a;">❄️ Snø neste {DAGER_FREMOVER} dager</h2>
   <div style="overflow-x:auto;">{lag_oversikt_html(oversikt, nye_nokler, i_dag)}</div>
+  <h2 style="margin:28px 0 12px;font-size:17px;color:#1f2d3a;">💨 Vind neste {DAGER_FREMOVER} dager</h2>
+  <div style="overflow-x:auto;">{lag_vind_html(oversikt, i_dag)}</div>
   {lag_detaljer_html(nye, "bekreftet")}
   {lag_detaljer_html(nye, "tidlig")}
 </td></tr>
@@ -385,8 +499,9 @@ def main():
             print(f"Klarte ikke hente prognose for {sted['navn']}: {feil}", file=sys.stderr)
             continue
 
-        snodager = finn_snodager(prognose)
-        oversikt[sted["navn"]] = snodager
+        dager = analyser_dager(prognose)
+        oversikt[sted["navn"]] = dager
+        snodager = {d: info for d, info in dager.items() if info["mm"] > 0}
 
         for dato_str, info in sorted(snodager.items()):
             dato = date.fromisoformat(dato_str)
@@ -422,13 +537,21 @@ def send_test():
     eksempel = [(0, 1, 2.4, -3), (0, 4, 6.1, -6), (1, 2, 0.6, -1), (2, 5, 3.0, -4),
                 (3, 1, 8.5, -7), (3, 2, 12.3, -9), (4, 0, 4.2, -11), (4, 3, 15.0, -14)]
     oversikt, nye = {}, []
+    retninger = [270, 225, 315, 180, 0, 45, 90, 135]
+    for s_idx, sted in enumerate(STEDER):
+        for dag in range(DAGER_FREMOVER + 1):
+            vind = 2 + (s_idx * 3 + dag * 2) % 16 + (6 if sted["navn"] == "Galdhøpiggen" else 0)
+            oversikt.setdefault(sted["navn"], {})[(i_dag + timedelta(days=dag)).isoformat()] = {
+                "mm": 0.0, "min_temp": None, "vind": float(vind),
+                "kast": float(vind * 1.6), "retning": retninger[(s_idx + dag) % 8],
+            }
     for s_idx, dag, mm, temp in eksempel:
         if s_idx >= len(STEDER):
             continue
         sted = STEDER[s_idx]
         dato = i_dag + timedelta(days=dag)
-        info = {"mm": mm, "min_temp": temp}
-        oversikt.setdefault(sted["navn"], {})[dato.isoformat()] = info
+        info = oversikt[sted["navn"]][dato.isoformat()]
+        info.update(mm=mm, min_temp=temp)
         nye.append({
             "sted": sted, "dato": dato, "info": info,
             "type": "bekreftet" if dag <= BEKREFTET_DAGER else "tidlig",
