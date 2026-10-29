@@ -25,12 +25,13 @@ STEDER = [
     {"navn": "Holleia", "lat": 60.15, "lon": 10.00},
     {"navn": "Meitsjøen", "lat": 60.3833, "lon": 11.8167},
     {"navn": "Ryskdalen", "lat": 61.3206, "lon": 12.6080},
+    {"navn": "Galdhøpiggen", "lat": 61.6364, "lon": 8.3125},
 ]
 
 DAGER_FREMOVER = 7        # Hvor langt frem i prognosen vi ser etter snø
 BEKREFTET_DAGER = 2       # Snø innen så mange dager gir «bekreftet varsel»;
                           # snø lenger frem gir «tidlig varsel»
-MIN_NEDBOR_MM = 0.0       # Minste nedbør (mm) i en periode for å telle som snø
+MIN_NEDBOR_MM = 0.1       # Minste nedbør (mm) i en periode for å telle som snø
 TA_MED_SLUDD = False      # Sett til True hvis sludd også skal gi varsel
 
 # MET krever at du identifiserer deg med navn på appen og kontaktinfo.
