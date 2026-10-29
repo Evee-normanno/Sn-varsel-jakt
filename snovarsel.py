@@ -169,4 +169,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if os.environ.get("TEST_EPOST") == "true":
+        steder = ", ".join(s["navn"] for s in STEDER)
+        send_epost(
+            "✅ Test fra Snøvarsel",
+            "Dette er en test. E-postoppsettet fungerer!\n\n"
+            f"Stedene som overvåkes: {steder}.",
+        )
+        print("Test-e-post sendt.")
+    else:
+        main()
