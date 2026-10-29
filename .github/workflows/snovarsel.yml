@@ -1,0 +1,35 @@
+name: Snøvarsel
+
+on:
+  schedule:
+    - cron: "15 */3 * * *"   # hver 3. time (UTC)
+  workflow_dispatch:          # gjør det mulig å kjøre manuelt for test
+
+permissions:
+  contents: write             # trengs for å lagre hvilke varsler som er sendt
+
+jobs:
+  sjekk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sjekk prognosen
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MET_KONTAKT: "snovarsel/1.0 ${{ secrets.SMTP_USER }}"
+        run: python snovarsel.py
+
+      - name: Lagre hva som er varslet
+        run: |
+          git config user.name "snovarsel-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add varslet.json
+          git diff --cached --quiet || git commit -m "Oppdater varslet.json"
+          git push
