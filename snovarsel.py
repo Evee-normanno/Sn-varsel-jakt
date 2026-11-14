@@ -1,6 +1,7 @@
 """
 Snøvarsel: sjekker værprognosen fra MET (samme data som Yr) for flere steder
-og sender e-post når det er meldt snø. E-posten viser også vind for alle steder. Varsler kommer i to trinn:
+og sender e-post når det er meldt snø. E-posten viser også vind for alle steder,
+og hvilke dager som har gode forhold for toppjakt (nysnø og rolig vind). Varsler kommer i to trinn:
 «tidlig varsel» for snø et stykke frem i tid, og «bekreftet» når snøen
 fortsatt står i prognosen kort tid før. Hvert trinn sendes bare én gang
 per sted og dato.
@@ -29,13 +30,23 @@ STEDER = [
     {"navn": "Holleia", "lat": 60.15, "lon": 10.00},
     {"navn": "Meitsjøen", "lat": 60.3833, "lon": 11.8167},
     {"navn": "Ryskdalen", "lat": 61.3206, "lon": 12.6080},
+    {"navn": "Galdhøpiggen", "lat": 61.6364, "lon": 8.3125},
 ]
 
-DAGER_FREMOVER = 7        # Hvor langt frem i prognosen vi ser etter snø
+DAGER_FREMOVER = 9        # Hvor langt frem i prognosen vi ser (Yr viser ca. 9 dager)
 BEKREFTET_DAGER = 2       # Snø innen så mange dager gir «bekreftet varsel»;
                           # snø lenger frem gir «tidlig varsel»
 MIN_NEDBOR_MM = 0.1       # Minste nedbør (mm) i en periode for å telle som snø
 TA_MED_SLUDD = False      # Sett til True hvis sludd også skal gi varsel
+
+# Jaktforhold (toppjakt etter tiur og orrfugl): en dag regnes som god når det
+# har kommet snø de siste dagene før, og det er rolig vind på dagtid.
+JAKT_MAKS_KAST = 6.0      # Høyeste vindkast (m/s) på dagtid for gode forhold
+JAKT_MIN_SNO_MM = 1.0     # Minst så mye nysnø (mm ≈ cm) før dagen
+JAKT_DAGER_ETTER_SNO = 2  # Snøfall så mange dager tilbake teller
+JAKT_FRA_KL = 6           # Dagtid som vinden vurderes for (lokal tid)
+JAKT_TIL_KL = 16
+JAKT_GIR_VARSEL = True    # Send e-post når en ny god jaktdag dukker opp
 
 # MET krever at du identifiserer deg med navn på appen og kontaktinfo.
 KONTAKT = os.environ.get("MET_KONTAKT", "snovarsel/1.0 ukjent@example.com")
@@ -83,6 +94,7 @@ def analyser_dager(prognose):
         dato = tid.astimezone(TIDSSONE).date().isoformat()
         dag = dager.setdefault(dato, {
             "mm": 0.0, "min_temp": None, "vind": None, "kast": None, "retning": None,
+            "kast_dag": None,
         })
 
         # Vind
@@ -93,6 +105,12 @@ def analyser_dager(prognose):
         kast = detaljer.get("wind_speed_of_gust")
         if kast is not None and (dag["kast"] is None or kast > dag["kast"]):
             dag["kast"] = kast
+
+        # Sterkeste kast på dagtid (for jaktforhold). Mangler kast, brukes middelvind.
+        if JAKT_FRA_KL <= tid.astimezone(TIDSSONE).hour <= JAKT_TIL_KL:
+            dagkast = kast if kast is not None else vind
+            if dagkast is not None and (dag["kast_dag"] is None or dagkast > dag["kast_dag"]):
+                dag["kast_dag"] = dagkast
 
         # Snø – bruk timesprognose der den finnes, ellers 6-timersprognose
         periode = data.get("next_1_hours") or data.get("next_6_hours")
@@ -107,6 +125,23 @@ def analyser_dager(prognose):
         if temp is not None and (dag["min_temp"] is None or temp < dag["min_temp"]):
             dag["min_temp"] = temp
     return dager
+
+
+def marker_jaktdager(dager):
+    """Setter info["jakt"] = True på dager med gode jaktforhold, og
+    info["jakt_sno"] = snømengden de foregående dagene."""
+    for dato_str, info in dager.items():
+        d = date.fromisoformat(dato_str)
+        sno = sum(
+            dager.get((d - timedelta(days=k)).isoformat(), {}).get("mm", 0.0)
+            for k in range(1, JAKT_DAGER_ETTER_SNO + 1)
+        )
+        info["jakt_sno"] = sno
+        info["jakt"] = (
+            sno >= JAKT_MIN_SNO_MM
+            and info.get("kast_dag") is not None
+            and info["kast_dag"] <= JAKT_MAKS_KAST
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +250,14 @@ def lag_tekst(nye):
             linjer.append(linje)
         if linjer:
             deler.append(tittel + ":\n" + "\n".join(linjer))
+    jakt = [
+        f"• {v['sted']['navn']}: {lang_dato(v['dato'])} – "
+        f"{v['info']['jakt_sno']:.1f} mm snø dagene før, "
+        f"kast opptil {v['info']['kast_dag']:.0f} m/s på dagtid"
+        for v in sorted((v for v in nye if v["type"] == "jakt"), key=lambda v: v["dato"])
+    ]
+    if jakt:
+        deler.append("GODE JAKTFORHOLD – nysnø og rolig vind:\n" + "\n".join(jakt))
     return (
         "\n\n".join(deler)
         + "\n\nSe detaljer på yr.no.\nData fra Meteorologisk institutt (CC BY 4.0)."
@@ -352,6 +395,90 @@ def lag_vind_html(oversikt, i_dag):
     )
 
 
+def lag_jakt_html(oversikt, nye_nokler, i_dag):
+    """Rutenett som viser hvilke dager som har gode jaktforhold."""
+    datoer = [i_dag + timedelta(days=i) for i in range(DAGER_FREMOVER + 1)]
+    hode = (
+        f'<th style="padding:8px 10px;text-align:left;font-size:12px;color:#5b6b7a;'
+        f'border-bottom:2px solid #d5e2ee;">Sted</th>'
+    )
+    for i, d in enumerate(datoer):
+        bg = "#f3f8fd" if i <= BEKREFTET_DAGER else "#ffffff"
+        hode += (
+            f'<th style="padding:8px 4px;text-align:center;font-size:12px;color:#5b6b7a;'
+            f'background:{bg};border-bottom:2px solid #d5e2ee;white-space:nowrap;">'
+            f"{UKEDAGER[d.weekday()]}<br>"
+            f'<span style="font-weight:normal;">{d.day}.{d.month}</span></th>'
+        )
+    rader = ""
+    for sted in STEDER:
+        navn = sted["navn"]
+        rad = (
+            f'<td style="padding:8px 10px;font-size:14px;font-weight:600;color:#1f2d3a;'
+            f'border-bottom:1px solid #e6edf3;white-space:nowrap;">{html.escape(navn)}</td>'
+        )
+        for d in datoer:
+            info = oversikt.get(navn, {}).get(d.isoformat())
+            if not info or not info.get("jakt"):
+                rad += (
+                    '<td style="padding:6px 4px;text-align:center;color:#c2ccd6;'
+                    'border-bottom:1px solid #e6edf3;">·</td>'
+                )
+                continue
+            ny = (navn, d.isoformat()) in nye_nokler
+            ramme = "border:2px solid #e0712c;" if ny else "border-bottom:1px solid #ffffff;"
+            rad += (
+                f'<td style="padding:5px 3px;text-align:center;background:#cdebd3;'
+                f'color:#1b5e2b;{ramme}">'
+                f'<div style="font-size:14px;font-weight:700;">✓</div>'
+                f'<div style="font-size:10px;white-space:nowrap;">{info["kast_dag"]:.0f} m/s</div></td>'
+            )
+        rader += f"<tr>{rad}</tr>"
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" width="100%" '
+        f'style="border-collapse:collapse;font-family:{FONT};">'
+        f"<tr>{hode}</tr>{rader}</table>"
+        f'<p style="margin:10px 0 0;font-size:12px;color:#5b6b7a;line-height:1.6;">'
+        f"✓ = minst {JAKT_MIN_SNO_MM:g} mm snø de siste {JAKT_DAGER_ETTER_SNO} dagene før, "
+        f"og vindkast på høyst {JAKT_MAKS_KAST:g} m/s mellom kl. {JAKT_FRA_KL:02d} og "
+        f"{JAKT_TIL_KL:02d}. Tallet er kraftigste kast på dagtid. "
+        f"Oransje ramme = ny jaktdag i denne e-posten.</p>"
+    )
+
+
+def lag_jakt_detaljer_html(nye):
+    rader = sorted((v for v in nye if v["type"] == "jakt"), key=lambda v: (v["dato"], v["sted"]["navn"]))
+    if not rader:
+        return ""
+    cell = "padding:8px 10px;font-size:14px;border-bottom:1px solid #e6edf3;color:#1f2d3a;"
+    th = (
+        "padding:8px 10px;font-size:12px;text-align:left;color:#5b6b7a;"
+        "border-bottom:2px solid #d5e2ee;"
+    )
+    linjer = "".join(
+        f"<tr>"
+        f'<td style="{cell}font-weight:600;">{html.escape(v["sted"]["navn"])}</td>'
+        f'<td style="{cell}white-space:nowrap;">{lang_dato(v["dato"])}</td>'
+        f'<td style="{cell}white-space:nowrap;">{v["info"]["jakt_sno"]:.1f} mm</td>'
+        f'<td style="{cell}white-space:nowrap;">{v["info"]["kast_dag"]:.0f} m/s</td>'
+        f'<td style="{cell}white-space:nowrap;"><a href="{yr_lenke(v["sted"])}" '
+        f'style="color:#2f6aa3;text-decoration:none;font-weight:600;">Yr →</a></td>'
+        f"</tr>"
+        for v in rader
+    )
+    return (
+        f'<h2 style="margin:28px 0 4px;font-size:17px;color:#1b5e2b;font-family:{FONT};">'
+        f"🌲 Nye gode jaktdager</h2>"
+        f'<p style="margin:0 0 10px;font-size:13px;color:#5b6b7a;font-family:{FONT};">'
+        f"Nysnø og rolig vind – gode forhold for toppjakt etter tiur og orrfugl.</p>"
+        '<table role="presentation" cellpadding="0" cellspacing="0" width="100%" '
+        f'style="border-collapse:collapse;font-family:{FONT};">'
+        f'<tr><th style="{th}">Sted</th><th style="{th}">Dag</th>'
+        f'<th style="{th}">Snø før</th><th style="{th}">Kast dagtid</th><th style="{th}"></th></tr>'
+        f"{linjer}</table>"
+    )
+
+
 def lag_detaljer_html(nye, type_varsel):
     rader = [v for v in nye if v["type"] == type_varsel]
     if not rader:
@@ -402,18 +529,27 @@ def lag_detaljer_html(nye, type_varsel):
 
 
 def lag_html(oversikt, nye, i_dag):
-    antall_steder = len({v["sted"]["navn"] for v in nye})
-    antall_bekreftet = sum(1 for v in nye if v["type"] == "bekreftet")
-    antall_tidlig = len(nye) - antall_bekreftet
+    sno = [v for v in nye if v["type"] in ("bekreftet", "tidlig")]
+    antall_steder = len({v["sted"]["navn"] for v in sno})
+    antall_bekreftet = sum(1 for v in sno if v["type"] == "bekreftet")
+    antall_tidlig = len(sno) - antall_bekreftet
+    antall_jakt = sum(1 for v in nye if v["type"] == "jakt")
 
-    sammendrag = []
-    if antall_bekreftet:
-        sammendrag.append(f"{antall_bekreftet} bekreftet")
-    if antall_tidlig:
-        sammendrag.append(f"{antall_tidlig} tidlig{'e' if antall_tidlig > 1 else ''}")
-    stedtekst = "1 sted" if antall_steder == 1 else f"{antall_steder} steder"
+    deler = []
+    if sno:
+        stedtekst = "1 sted" if antall_steder == 1 else f"{antall_steder} steder"
+        typer = []
+        if antall_bekreftet:
+            typer.append(f"{antall_bekreftet} bekreftet")
+        if antall_tidlig:
+            typer.append(f"{antall_tidlig} tidlig{'e' if antall_tidlig > 1 else ''}")
+        deler.append(f"Ny snø for {stedtekst} ({' og '.join(typer)})")
+    if antall_jakt:
+        deler.append(f"{antall_jakt} ny{'e' if antall_jakt > 1 else ''} god{'e' if antall_jakt > 1 else ''} jaktdag{'er' if antall_jakt > 1 else ''}")
+    sammendrag = " · ".join(deler)
 
-    nye_nokler = {(v["sted"]["navn"], v["dato"].isoformat()) for v in nye}
+    nye_nokler = {(v["sted"]["navn"], v["dato"].isoformat()) for v in sno}
+    nye_jakt = {(v["sted"]["navn"], v["dato"].isoformat()) for v in nye if v["type"] == "jakt"}
     oppdatert = datetime.now(TIDSSONE)
 
     return f"""\
@@ -432,7 +568,7 @@ def lag_html(oversikt, nye, i_dag):
 <tr><td style="background:#1f4e79;padding:24px 28px;">
   <div style="font-size:24px;font-weight:700;color:#ffffff;">❄️ Snøvarsel</div>
   <div style="font-size:14px;color:#cfe2f3;margin-top:6px;">
-    Ny snø i prognosen for {stedtekst} · {" og ".join(sammendrag)}
+    {sammendrag}
   </div>
 </td></tr>
 
@@ -441,6 +577,9 @@ def lag_html(oversikt, nye, i_dag):
   <div style="overflow-x:auto;">{lag_oversikt_html(oversikt, nye_nokler, i_dag)}</div>
   <h2 style="margin:28px 0 12px;font-size:17px;color:#1f2d3a;">💨 Vind neste {DAGER_FREMOVER} dager</h2>
   <div style="overflow-x:auto;">{lag_vind_html(oversikt, i_dag)}</div>
+  <h2 style="margin:28px 0 12px;font-size:17px;color:#1f2d3a;">🌲 Jaktforhold neste {DAGER_FREMOVER} dager</h2>
+  <div style="overflow-x:auto;">{lag_jakt_html(oversikt, nye_jakt, i_dag)}</div>
+  {lag_jakt_detaljer_html(nye)}
   {lag_detaljer_html(nye, "bekreftet")}
   {lag_detaljer_html(nye, "tidlig")}
 </td></tr>
@@ -484,6 +623,18 @@ def send_epost(emne, tekst, html_innhold=None):
 # ---------------------------------------------------------------------------
 
 
+def lag_emne(nye):
+    typer = {v["type"] for v in nye}
+    deler = []
+    if "bekreftet" in typer:
+        deler.append("❄️ Snø bekreftet!")
+    elif "tidlig" in typer:
+        deler.append("🌨️ Tidlig snøvarsel")
+    if "jakt" in typer:
+        deler.append("🌲 Gode jaktforhold")
+    return " · ".join(deler)
+
+
 def main():
     tilstand = les_tilstand()
     i_dag = datetime.now(TIDSSONE).date()
@@ -499,6 +650,7 @@ def main():
             continue
 
         dager = analyser_dager(prognose)
+        marker_jaktdager(dager)
         oversikt[sted["navn"]] = dager
         snodager = {d: info for d, info in dager.items() if info["mm"] > 0}
 
@@ -518,14 +670,23 @@ def main():
                 and f"{sted['navn']}|{dato_str}|tidlig" in tilstand,
             })
 
+        for dato_str, info in sorted(dager.items()):
+            if not (JAKT_GIR_VARSEL and info.get("jakt")):
+                continue
+            nokkel = f"{sted['navn']}|{dato_str}|jakt"
+            if nokkel in tilstand:
+                continue
+            tilstand[nokkel] = naa
+            nye.append({"sted": sted, "dato": date.fromisoformat(dato_str), "info": info,
+                        "type": "jakt", "var_tidlig": False})
+
     if nye:
-        har_bekreftet = any(v["type"] == "bekreftet" for v in nye)
-        emne = "❄️ Snø bekreftet!" if har_bekreftet else "🌨️ Tidlig snøvarsel"
+        emne = lag_emne(nye)
         tekst = lag_tekst(nye)
         print(tekst)
         send_epost(emne, tekst, lag_html(oversikt, nye, i_dag))
     else:
-        print("Ingen ny snø i prognosen.")
+        print("Ingen ny snø eller nye jaktdager i prognosen.")
 
     lagre_tilstand(tilstand)
 
@@ -543,7 +704,13 @@ def send_test():
             oversikt.setdefault(sted["navn"], {})[(i_dag + timedelta(days=dag)).isoformat()] = {
                 "mm": 0.0, "min_temp": None, "vind": float(vind),
                 "kast": float(vind * 1.6), "retning": retninger[(s_idx + dag) % 8],
+                "kast_dag": float(vind * 1.4),
             }
+    # Noen rolige dager etter snøfall, så eksempelet viser gode jaktdager
+    for s_idx, dag in [(0, 2), (0, 5), (1, 3), (2, 6), (3, 3), (3, 4)]:
+        if s_idx < len(STEDER):
+            info = oversikt[STEDER[s_idx]["navn"]][(i_dag + timedelta(days=dag)).isoformat()]
+            info.update(vind=2.0, kast=4.0, kast_dag=4.0)
     for s_idx, dag, mm, temp in eksempel:
         if s_idx >= len(STEDER):
             continue
@@ -556,6 +723,12 @@ def send_test():
             "type": "bekreftet" if dag <= BEKREFTET_DAGER else "tidlig",
             "var_tidlig": dag == 1,
         })
+    for sted in STEDER:
+        marker_jaktdager(oversikt[sted["navn"]])
+        for dato_str, info in sorted(oversikt[sted["navn"]].items()):
+            if info["jakt"]:
+                nye.append({"sted": sted, "dato": date.fromisoformat(dato_str), "info": info,
+                            "type": "jakt", "var_tidlig": False})
     send_epost(
         "✅ Test fra Snøvarsel (eksempeldata)",
         "TEST – dette er oppdiktede tall, ikke en ekte prognose.\n\n" + lag_tekst(nye),
