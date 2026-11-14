@@ -41,7 +41,7 @@ TA_MED_SLUDD = False      # Sett til True hvis sludd også skal gi varsel
 
 # Jaktforhold (toppjakt etter tiur og orrfugl): en dag regnes som god når det
 # har kommet snø de siste dagene før, og det er rolig vind på dagtid.
-JAKT_MAKS_KAST = 6.0      # Høyeste vindkast (m/s) på dagtid for gode forhold
+JAKT_MAKS_KAST = 8.0      # Høyeste vindkast (m/s) på dagtid for gode forhold
 JAKT_MIN_SNO_MM = 1.0     # Minst så mye nysnø (mm ≈ cm) før dagen
 JAKT_DAGER_ETTER_SNO = 2  # Snøfall så mange dager tilbake teller
 JAKT_FRA_KL = 6           # Dagtid som vinden vurderes for (lokal tid)
