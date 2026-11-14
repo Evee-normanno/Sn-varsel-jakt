@@ -30,7 +30,6 @@ STEDER = [
     {"navn": "Holleia", "lat": 60.15, "lon": 10.00},
     {"navn": "Meitsjøen", "lat": 60.3833, "lon": 11.8167},
     {"navn": "Ryskdalen", "lat": 61.3206, "lon": 12.6080},
-    {"navn": "Galdhøpiggen", "lat": 61.6364, "lon": 8.3125},
 ]
 
 DAGER_FREMOVER = 9        # Hvor langt frem i prognosen vi ser (Yr viser ca. 9 dager)
