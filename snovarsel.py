@@ -40,12 +40,17 @@ TA_MED_SLUDD = False      # Sett til True hvis sludd også skal gi varsel
 
 # Jaktforhold (toppjakt etter tiur og orrfugl): en dag regnes som god når det
 # har kommet snø de siste dagene før, og det er rolig vind på dagtid.
-JAKT_MAKS_KAST = 8.0      # Høyeste vindkast (m/s) på dagtid for gode forhold
+JAKT_MAKS_KAST = 6.0      # Høyeste vindkast (m/s) på dagtid for gode forhold
 JAKT_MIN_SNO_MM = 1.0     # Minst så mye nysnø (mm ≈ cm) før dagen
 JAKT_DAGER_ETTER_SNO = 2  # Snøfall så mange dager tilbake teller
 JAKT_FRA_KL = 6           # Dagtid som vinden vurderes for (lokal tid)
 JAKT_TIL_KL = 16
 JAKT_GIR_VARSEL = True    # Send e-post når en ny god jaktdag dukker opp
+
+# Egen e-post til hjemmebane når nye jaktdager dukker opp.
+# Mottakere legges inn som GitHub-secret MAIL_TO_HJEMME.
+HJEMME_AKTIV = True
+JAKTLAGET = "Jaktlaget"   # Underskrift, f.eks. "Even og Norman"
 
 # MET krever at du identifiserer deg med navn på appen og kontaktinfo.
 KONTAKT = os.environ.get("MET_KONTAKT", "snovarsel/1.0 ukjent@example.com")
@@ -598,16 +603,19 @@ def lag_html(oversikt, nye, i_dag):
 # ---------------------------------------------------------------------------
 
 
-def send_epost(emne, tekst, html_innhold=None):
+def send_epost(emne, tekst, html_innhold=None, mottaker=None, svar_til=None,
+               avsender_navn="Snøvarsel"):
     bruker = os.environ["SMTP_USER"]
     passord = os.environ["SMTP_PASS"]
-    mottaker = os.environ.get("MAIL_TO", bruker)
+    mottaker = mottaker or os.environ.get("MAIL_TO", bruker)
     vert = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 
     melding = EmailMessage()
     melding["Subject"] = emne
-    melding["From"] = f"Snøvarsel <{bruker}>"
+    melding["From"] = f"{avsender_navn} <{bruker}>"
     melding["To"] = mottaker
+    if svar_til:
+        melding["Reply-To"] = svar_til
     melding.set_content(tekst)
     if html_innhold:
         melding.add_alternative(html_innhold, subtype="html")
@@ -615,6 +623,261 @@ def send_epost(emne, tekst, html_innhold=None):
     with smtplib.SMTP_SSL(vert, 465) as server:
         server.login(bruker, passord)
         server.send_message(melding)
+
+
+# ---------------------------------------------------------------------------
+# E-post til hjemmebane («Jaktkomiteen informerer»)
+# ---------------------------------------------------------------------------
+
+SIKKERHET = {
+    3: ("Ganske sikkert", "#2e7d32"),
+    2: ("Godt mulig", "#e8701a"),
+    1: ("Tidlig antydning", "#9e9e9e"),
+}
+
+
+def sikkerhet(dato, i_dag):
+    unna = (dato - i_dag).days
+    if unna <= BEKREFTET_DAGER:
+        return 3
+    if unna <= 5:
+        return 2
+    return 1
+
+
+def samle_jaktdager(oversikt, i_dag):
+    """Alle gode jaktdager fremover, gruppert per dato:
+    [(dato, [(stedsnavn, info), ...]), ...] sortert etter dato."""
+    per_dato = {}
+    for sted in STEDER:
+        for dato_str, info in oversikt.get(sted["navn"], {}).items():
+            dato = date.fromisoformat(dato_str)
+            if info.get("jakt") and dato >= i_dag:
+                per_dato.setdefault(dato, []).append((sted["navn"], info))
+    return sorted(per_dato.items())
+
+
+def velg_favoritt(jaktdager, i_dag):
+    """Den mest sannsynlige dagen: sikrest prognose, deretter mest snø og minst vind."""
+    if not jaktdager:
+        return None
+    def poeng(element):
+        dato, steder = element
+        sno = max(info["jakt_sno"] for _, info in steder)
+        kast = min(info["kast_dag"] for _, info in steder)
+        return (sikkerhet(dato, i_dag), sno - kast, -dato.toordinal())
+    return max(jaktdager, key=poeng)[0]
+
+
+def maaler_html(niva):
+    farge = SIKKERHET[niva][1]
+    celler = "".join(
+        f'<td style="width:22px;height:10px;background:{farge if i < niva else "#e3ddd0"};'
+        f'border-radius:5px;"></td><td style="width:4px;"></td>'
+        for i in range(3)
+    )
+    return (
+        '<table role="presentation" cellpadding="0" cellspacing="0" style="display:inline-table;'
+        f'vertical-align:middle;"><tr>{celler}</tr></table>'
+    )
+
+
+def lag_hjemme_emne(jaktdager, favoritt):
+    fav = lang_dato(favoritt)
+    andre = len(jaktdager) - 1
+    tillegg = f" (+{andre} dag{'er' if andre > 1 else ''} til)" if andre > 0 else ""
+    return f"📣 Jaktkomiteen informerer: Mulig jakt {fav}{tillegg}"
+
+
+def lag_hjemme_tekst(jaktdager, favoritt, i_dag):
+    linjer = [
+        "Kjære ledelse på hjemmebane!",
+        "",
+        "Værgudene har talt: Det er meldt nysnø og vindstille – akkurat det tiuren frykter mest.",
+        "Vi melder derfor fra i god tid, slik dere har bedt om. Følgende dager er aktuelle:",
+        "",
+    ]
+    for dato, steder in jaktdager:
+        niva = SIKKERHET[sikkerhet(dato, i_dag)][0]
+        fav = "  ⭐ FAVORITT" if dato == favoritt else ""
+        linjer.append(f"• {lang_dato(dato)}: {', '.join(n for n, _ in steder)} – {niva}{fav}")
+    linjer += [
+        "",
+        "Forventet fravær: fra morgengry til mørket faller på.",
+        "Forventet fangst: uviss (som vanlig).",
+        "Værmeldinger kan endre seg – ny beskjed kommer så snart vi vet mer.",
+        "",
+        f"Med ærbødig hilsen\n{JAKTLAGET}",
+    ]
+    return "\n".join(linjer)
+
+
+def lag_hjemme_html(jaktdager, nye_datoer, favoritt, i_dag, svar_til):
+    font = "Georgia,'Times New Roman',serif"
+    sans = FONT
+    svar = quote(svar_til.replace(" ", ""), safe="@,")
+
+    kort = ""
+    for dato, steder in jaktdager:
+        niva = sikkerhet(dato, i_dag)
+        tekst_niva, farge_niva = SIKKERHET[niva]
+        er_fav = dato == favoritt
+        ramme = "3px solid #e8701a" if er_fav else "1px solid #e3ddd0"
+        merker = ""
+        if er_fav:
+            merker += (
+                '<span style="display:inline-block;background:#e8701a;color:#ffffff;font-size:11px;'
+                'font-weight:700;padding:3px 8px;border-radius:10px;margin-right:6px;'
+                'letter-spacing:0.5px;">⭐ JAKTKOMITEENS FAVORITT</span>'
+            )
+        if dato in nye_datoer:
+            merker += (
+                '<span style="display:inline-block;background:#1f4d2b;color:#ffffff;font-size:11px;'
+                'font-weight:700;padding:3px 8px;border-radius:10px;letter-spacing:0.5px;">NY</span>'
+            )
+        stedliste = "<br>".join(
+            f'📍 <b>{html.escape(navn)}</b> '
+            f'<span style="color:#7a6f5c;font-size:13px;">– {info["jakt_sno"]:.0f} cm nysnø, '
+            f'vind {info["kast_dag"]:.0f} m/s</span>'
+            for navn, info in steder
+        )
+        kort += f"""
+<tr><td style="padding:0 0 14px;">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%"
+       style="background:#ffffff;border:{ramme};border-radius:12px;">
+<tr>
+  <td width="92" valign="top" style="padding:16px 0 16px 16px;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="76"
+           style="border-radius:8px;overflow:hidden;border:1px solid #d9cfbb;">
+      <tr><td style="background:#c0392b;color:#ffffff;text-align:center;font-family:{sans};
+                     font-size:12px;font-weight:700;padding:4px 0;text-transform:uppercase;
+                     letter-spacing:1px;">{UKEDAGER[dato.weekday()]}</td></tr>
+      <tr><td style="background:#ffffff;text-align:center;font-family:{font};font-size:34px;
+                     font-weight:700;color:#2b2b2b;padding:4px 0 0;line-height:1;">{dato.day}</td></tr>
+      <tr><td style="background:#ffffff;text-align:center;font-family:{sans};font-size:12px;
+                     color:#7a6f5c;padding:2px 0 6px;">{MANEDER[dato.month - 1]}</td></tr>
+    </table>
+  </td>
+  <td valign="top" style="padding:16px 18px 16px 14px;font-family:{sans};color:#2b2b2b;">
+    <div style="margin-bottom:6px;">{merker}</div>
+    <div style="font-family:{font};font-size:19px;font-weight:700;margin-bottom:6px;">
+      {UKEDAGER_LANG[dato.weekday()].capitalize()} {dato.day}. {MANEDER[dato.month - 1]}
+    </div>
+    <div style="font-size:14px;line-height:1.7;margin-bottom:10px;">{stedliste}</div>
+    <div style="font-size:13px;color:#7a6f5c;">
+      Sannsynlighet: {maaler_html(niva)}
+      <b style="color:{farge_niva};margin-left:6px;">{tekst_niva}</b>
+    </div>
+  </td>
+</tr></table>
+</td></tr>"""
+
+    def knapp(tekst, emne, bg, fg):
+        return (
+            f'<a href="mailto:{svar}?subject={quote(emne)}" style="display:inline-block;'
+            f'background:{bg};color:{fg};font-family:{sans};font-size:14px;font-weight:700;'
+            f'text-decoration:none;padding:12px 18px;border-radius:24px;margin:4px;">{tekst}</a>'
+        )
+
+    fav_tekst = lang_dato(favoritt)
+    return f"""\
+<!DOCTYPE html>
+<html lang="no"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">
+</head>
+<body style="margin:0;padding:0;background:#efe8da;">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#efe8da;">
+<tr><td align="center" style="padding:24px 12px;">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%"
+       style="max-width:600px;background:#f8f4ec;border-radius:16px;overflow:hidden;">
+
+<tr><td style="background:#1f4d2b;padding:30px 28px 26px;text-align:center;">
+  <div style="font-size:44px;line-height:1;">🌲📣🌲</div>
+  <div style="font-family:{sans};font-size:12px;color:#f3c58f;letter-spacing:3px;
+              font-weight:700;margin-top:14px;">OFFISIELT VARSEL</div>
+  <div style="font-family:{font};font-size:30px;font-weight:700;color:#ffffff;margin-top:6px;">
+    Jaktkomiteen informerer</div>
+  <div style="font-family:{sans};font-size:14px;color:#cfe3d3;margin-top:8px;">
+    Til ledelsen på hjemmebane – til orientering og (forhåpentlig) godkjenning</div>
+</td></tr>
+
+<tr><td style="background:#e8701a;padding:10px 28px;text-align:center;font-family:{sans};
+               font-size:14px;font-weight:700;color:#ffffff;">
+  ⭐ Mest sannsynlige jaktdag: {fav_tekst}
+</td></tr>
+
+<tr><td style="padding:26px 28px 6px;font-family:{font};font-size:16px;line-height:1.6;color:#2b2b2b;">
+  <p style="margin:0 0 12px;">Kjære ledelse,</p>
+  <p style="margin:0 0 12px;">Værgudene har talt. Det er meldt <b>nysnø</b> og <b>vindstille</b>
+  – den farligste kombinasjonen som finnes for en tiur. Jaktlaget har derfor
+  den store ære å melde fra i god tid, nøyaktig slik dere har bedt om
+  (gjentatte ganger).</p>
+  <p style="margin:0 0 18px;">Følgende dager er under vurdering:</p>
+</td></tr>
+
+<tr><td style="padding:0 28px;">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%">{kort}</table>
+</td></tr>
+
+<tr><td style="padding:10px 28px 4px;">
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%"
+       style="background:#fff8ec;border:2px dashed #d9b98a;border-radius:12px;">
+<tr><td style="padding:18px 20px;font-family:{sans};font-size:14px;line-height:1.9;color:#2b2b2b;">
+  <div style="font-family:{font};font-size:17px;font-weight:700;margin-bottom:6px;">
+    📋 Praktisk informasjon</div>
+  🕔 <b>Forventet fravær:</b> fra morgengry til mørket faller på<br>
+  🪶 <b>Forventet fangst:</b> uviss (som vanlig)<br>
+  📵 <b>Dekning:</b> varierende – vi ringer når vi er tilbake på veien<br>
+  🍽️ <b>Middag:</b> jaktlaget tar oppvasken dagen etter (dette er et løfte)
+</td></tr></table>
+</td></tr>
+
+<tr><td style="padding:22px 28px 8px;text-align:center;">
+  <div style="font-family:{font};font-size:17px;font-weight:700;color:#2b2b2b;margin-bottom:10px;">
+    Ledelsens vurdering:</div>
+  {knapp("👍 Godkjent!", "Godkjent – god jakt!", "#2e7d32", "#ffffff")}
+  {knapp("🤔 Vi må snakke sammen", "Om jaktplanene …", "#ffffff", "#1f4d2b")}
+</td></tr>
+
+<tr><td style="padding:18px 28px 26px;text-align:center;font-family:{sans};font-size:12px;
+               line-height:1.6;color:#8a7f6a;">
+  Med ærbødig hilsen<br>
+  <span style="font-family:{font};font-size:16px;color:#2b2b2b;font-style:italic;">{html.escape(JAKTLAGET)}</span>
+  <br><br>
+  Jaktkomiteen tar forbehold om at værmeldingen kan endre seg.
+  Ny beskjed kommer så snart vi vet mer.<br>
+  Grønn måler = ganske sikkert · oransje = godt mulig · grå = tidlig antydning.
+</td></tr>
+
+</table></td></tr></table></body></html>"""
+
+
+def send_hjemme_epost(oversikt, nye, i_dag, mottaker=None, test=False):
+    """Sender «Jaktkomiteen informerer» når det har dukket opp nye jaktdager."""
+    mottaker = mottaker or os.environ.get("MAIL_TO_HJEMME", "").strip()
+    if not (HJEMME_AKTIV and mottaker):
+        return
+    nye_datoer = {v["dato"] for v in nye if v["type"] == "jakt"}
+    if not nye_datoer:
+        return
+    jaktdager = samle_jaktdager(oversikt, i_dag)
+    favoritt = velg_favoritt(jaktdager, i_dag)
+    if favoritt is None:
+        return
+    svar_til = os.environ.get("MAIL_TO") or os.environ.get("SMTP_USER", "")
+    emne = lag_hjemme_emne(jaktdager, favoritt)
+    if test:
+        emne = "✅ TEST – " + emne
+    send_epost(
+        emne,
+        lag_hjemme_tekst(jaktdager, favoritt, i_dag),
+        lag_hjemme_html(jaktdager, nye_datoer, favoritt, i_dag, svar_til),
+        mottaker=mottaker,
+        svar_til=svar_til,
+        avsender_navn="Jaktkomiteen",
+    )
+    print(f"Hjemmebane-e-post sendt til {mottaker}.")
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +947,7 @@ def main():
         tekst = lag_tekst(nye)
         print(tekst)
         send_epost(emne, tekst, lag_html(oversikt, nye, i_dag))
+        send_hjemme_epost(oversikt, nye, i_dag)
     else:
         print("Ingen ny snø eller nye jaktdager i prognosen.")
 
@@ -737,6 +1001,9 @@ def send_test():
             "padding:3px 8px;border-radius:4px;vertical-align:middle;\">TEST</span></div>",
         ),
     )
+    # Hjemmebane-e-posten sendes som test til jegerne selv, ikke til hjemmebane
+    send_hjemme_epost(oversikt, nye, i_dag,
+                      mottaker=os.environ.get("MAIL_TO") or os.environ["SMTP_USER"], test=True)
     print("Test-e-post sendt.")
 
 
